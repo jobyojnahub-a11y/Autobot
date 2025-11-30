@@ -4,11 +4,10 @@ import asyncio
 import aiohttp
 import base64
 from flask import Flask, render_template_string, request, jsonify, redirect, session
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import yt_dlp
 from datetime import datetime
-import threading
 import secrets
 
 # Flask App for Admin Panel
@@ -144,7 +143,6 @@ ADMIN_PANEL_HTML = """
             const res = await fetch('/api/data');
             const data = await res.json();
             
-            // Load channels
             const channelsList = document.getElementById('channels-list');
             channelsList.innerHTML = '';
             for (const [id, channel] of Object.entries(data.channels)) {
@@ -159,7 +157,6 @@ ADMIN_PANEL_HTML = """
                 `;
             }
             
-            // Load batches
             const batchesList = document.getElementById('batches-list');
             batchesList.innerHTML = '';
             for (const [id, batch] of Object.entries(data.batches)) {
@@ -172,7 +169,6 @@ ADMIN_PANEL_HTML = """
                 `;
             }
             
-            // Load connections
             const connectionsList = document.getElementById('connections-list');
             connectionsList.innerHTML = '';
             for (const [id, channel] of Object.entries(data.channels)) {
@@ -186,7 +182,6 @@ ADMIN_PANEL_HTML = """
                 }
             }
             
-            // Update dropdowns
             const channelSelect = document.getElementById('connect-channel');
             const batchSelect = document.getElementById('connect-batch');
             channelSelect.innerHTML = '<option value="">Select Channel</option>';
@@ -350,19 +345,16 @@ def disconnect():
     save_db(db)
     return jsonify({'success': True})
 
-# Telegram Bot
+# Telegram Bot Functions
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /check command"""
     chat_id = str(update.effective_chat.id)
     db = load_db()
     
-    # Log for debugging
-    print(f"Received /check from chat_id: {chat_id}")
-    print(f"Registered channels: {list(db['channels'].keys())}")
+    print(f"📥 Received /check from chat_id: {chat_id}")
     
-    # Find channel info
     if chat_id not in db['channels']:
-        await update.message.reply_text(f'❌ This channel is not registered.\nChat ID: {chat_id}\n\nPlease add this ID in admin panel.')
+        await update.message.reply_text(f'❌ Channel not registered!\n\nYour Chat ID: `{chat_id}`\n\nAdd this ID in admin panel.', parse_mode='Markdown')
         return
     
     channel = db['channels'][chat_id]
@@ -370,7 +362,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ No batch connected to this channel.')
         return
     
-    batch_id = channel['batches'][0]  # Use first connected batch
+    batch_id = channel['batches'][0]
     batch = db['batches'].get(batch_id)
     
     if not batch:
@@ -380,7 +372,6 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f'🔍 Checking batch: {batch["name"]}...')
     
     try:
-        # Fetch subjects
         async with aiohttp.ClientSession() as session:
             headers = {
                 'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -390,7 +381,6 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get(f'https://rarestudy.site/subjects/{batch_id}', headers=headers) as resp:
                 html = await resp.text()
                 
-            # Parse HTML to find today's completed classes
             import re
             ended_classes = re.findall(r'handleVideo\(\'Ended\', \'(/media/[^\']+)', html)
             
@@ -400,16 +390,15 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await update.message.reply_text(f'📚 Found {len(ended_classes)} completed class(es). Processing...')
             
-            for media_path in ended_classes[:3]:  # Limit to 3 classes
+            for media_path in ended_classes[:2]:
                 try:
-                    # Get video data
-                    async with session.get(f'https://rarestudy.site/video-data?encoded={media_path.split("/")[-1]}', headers=headers) as resp:
+                    encoded = media_path.split('/')[-1]
+                    async with session.get(f'https://rarestudy.site/video-data?encoded={encoded}', headers=headers) as resp:
                         video_data = await resp.json()
                     
                     if not video_data.get('success'):
                         continue
                     
-                    # Decrypt URL
                     async with session.get(f'https://pdablu-yourl.wasmer.app/?data={video_data["data"]}') as resp:
                         url_data = await resp.json()
                     
@@ -417,54 +406,41 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not m3u8_url:
                         continue
                     
-                    # Download video
-                    status_msg = await update.message.reply_text('⬇️ Downloading video... 0%')
+                    status_msg = await update.message.reply_text('⬇️ Downloading video...')
                     output_file = f'video_{int(datetime.now().timestamp())}.mp4'
-                    
-                    # Progress hook for yt-dlp
-                    def progress_hook(d):
-                        if d['status'] == 'downloading':
-                            try:
-                                percent = d.get('_percent_str', '0%').strip()
-                                asyncio.create_task(status_msg.edit_text(f'⬇️ Downloading video... {percent}'))
-                            except:
-                                pass
                     
                     ydl_opts = {
                         'format': 'best',
                         'outtmpl': output_file,
                         'quiet': True,
                         'no_warnings': True,
-                        'progress_hooks': [progress_hook],
                     }
                     
-                    # Run download in executor to avoid blocking
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([m3u8_url]))
                     
-                    await status_msg.edit_text('⬆️ Uploading video to channel...')
-                    
-                    # Upload video
                     if os.path.exists(output_file):
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            video=open(output_file, 'rb'),
-                            caption=f'📹 Class Video\n⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}',
-                            supports_streaming=True
-                        )
+                        await status_msg.edit_text('⬆️ Uploading video...')
                         
-                        # Cleanup
+                        with open(output_file, 'rb') as video:
+                            await context.bot.send_video(
+                                chat_id=chat_id,
+                                video=video,
+                                caption=f'📹 Class Video\n⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}',
+                                supports_streaming=True
+                            )
+                        
                         os.remove(output_file)
-                        await status_msg.edit_text('✅ Video uploaded successfully!')
+                        await status_msg.edit_text('✅ Video uploaded!')
                     else:
                         await status_msg.edit_text('❌ Download failed!')
                         
                 except Exception as e:
-                    print(f"Error processing video: {str(e)}")
+                    print(f"❌ Error: {str(e)}")
                     await update.message.reply_text(f'❌ Error: {str(e)[:100]}')
-                    continue
-                
+                    
     except Exception as e:
+        print(f"❌ Main Error: {str(e)}")
         await update.message.reply_text(f'❌ Error: {str(e)}')
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,26 +452,42 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Admin Panel: Access via your Render URL'
     )
 
-def start_bot():
-    """Start the Telegram bot"""
-    BOT_TOKEN = os.getenv('BOT_TOKEN', '8591136175:AAGOS1YC24tIvhojvk9C8DDcHe9M7fF9L_A')
+# Global bot application
+bot_app = None
+
+async def start_bot_async():
+    """Start bot in async context"""
+    global bot_app
+    BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
     
     if BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("❌ BOT_TOKEN not set! Please add it in Render environment variables.")
+        print("❌ BOT_TOKEN not set!")
         return
     
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler('start', start_command))
-    application.add_handler(CommandHandler('check', check_command))
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler('start', start_command))
+    bot_app.add_handler(CommandHandler('check', check_command))
     
-    print("✅ Telegram bot started polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    print("✅ Telegram bot starting...")
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling(drop_pending_updates=True)
+    print("✅ Bot is running!")
+
+def run_bot():
+    """Run bot in new event loop"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(start_bot_async())
+    loop.run_forever()
 
 if __name__ == '__main__':
-    # Start bot in a separate thread
-    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    import threading
+    
+    # Start bot in separate thread with new event loop
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
     
-    # Start Flask app
-    port = int(os.getenv('PORT', 5000))
+    # Start Flask
+    port = int(os.getenv('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
