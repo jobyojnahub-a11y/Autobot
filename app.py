@@ -356,9 +356,13 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     db = load_db()
     
+    # Log for debugging
+    print(f"Received /check from chat_id: {chat_id}")
+    print(f"Registered channels: {list(db['channels'].keys())}")
+    
     # Find channel info
     if chat_id not in db['channels']:
-        await update.message.reply_text('❌ This channel is not registered in the admin panel.')
+        await update.message.reply_text(f'❌ This channel is not registered.\nChat ID: {chat_id}\n\nPlease add this ID in admin panel.')
         return
     
     channel = db['channels'][chat_id]
@@ -397,44 +401,68 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f'📚 Found {len(ended_classes)} completed class(es). Processing...')
             
             for media_path in ended_classes[:3]:  # Limit to 3 classes
-                # Get video data
-                async with session.get(f'https://rarestudy.site/video-data?encoded={media_path.split("/")[-1]}', headers=headers) as resp:
-                    video_data = await resp.json()
-                
-                if not video_data.get('success'):
+                try:
+                    # Get video data
+                    async with session.get(f'https://rarestudy.site/video-data?encoded={media_path.split("/")[-1]}', headers=headers) as resp:
+                        video_data = await resp.json()
+                    
+                    if not video_data.get('success'):
+                        continue
+                    
+                    # Decrypt URL
+                    async with session.get(f'https://pdablu-yourl.wasmer.app/?data={video_data["data"]}') as resp:
+                        url_data = await resp.json()
+                    
+                    m3u8_url = url_data.get('m3u8_url')
+                    if not m3u8_url:
+                        continue
+                    
+                    # Download video
+                    status_msg = await update.message.reply_text('⬇️ Downloading video... 0%')
+                    output_file = f'video_{int(datetime.now().timestamp())}.mp4'
+                    
+                    # Progress hook for yt-dlp
+                    def progress_hook(d):
+                        if d['status'] == 'downloading':
+                            try:
+                                percent = d.get('_percent_str', '0%').strip()
+                                asyncio.create_task(status_msg.edit_text(f'⬇️ Downloading video... {percent}'))
+                            except:
+                                pass
+                    
+                    ydl_opts = {
+                        'format': 'best',
+                        'outtmpl': output_file,
+                        'quiet': True,
+                        'no_warnings': True,
+                        'progress_hooks': [progress_hook],
+                    }
+                    
+                    # Run download in executor to avoid blocking
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([m3u8_url]))
+                    
+                    await status_msg.edit_text('⬆️ Uploading video to channel...')
+                    
+                    # Upload video
+                    if os.path.exists(output_file):
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=open(output_file, 'rb'),
+                            caption=f'📹 Class Video\n⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}',
+                            supports_streaming=True
+                        )
+                        
+                        # Cleanup
+                        os.remove(output_file)
+                        await status_msg.edit_text('✅ Video uploaded successfully!')
+                    else:
+                        await status_msg.edit_text('❌ Download failed!')
+                        
+                except Exception as e:
+                    print(f"Error processing video: {str(e)}")
+                    await update.message.reply_text(f'❌ Error: {str(e)[:100]}')
                     continue
-                
-                # Decrypt URL
-                async with session.get(f'https://pdablu-yourl.wasmer.app/?data={video_data["data"]}') as resp:
-                    url_data = await resp.json()
-                
-                m3u8_url = url_data.get('m3u8_url')
-                if not m3u8_url:
-                    continue
-                
-                # Download video
-                await update.message.reply_text('⬇️ Downloading video...')
-                output_file = f'video_{datetime.now().timestamp()}.mp4'
-                
-                ydl_opts = {
-                    'format': 'best',
-                    'outtmpl': output_file,
-                    'quiet': True
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([m3u8_url])
-                
-                # Upload video
-                await update.message.reply_text('⬆️ Uploading video...')
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=open(output_file, 'rb'),
-                    caption=f'📹 Class Video\n⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}'
-                )
-                
-                # Cleanup
-                os.remove(output_file)
                 
     except Exception as e:
         await update.message.reply_text(f'❌ Error: {str(e)}')
@@ -450,13 +478,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def start_bot():
     """Start the Telegram bot"""
-    BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+    BOT_TOKEN = os.getenv('BOT_TOKEN', '8591136175:AAGOS1YC24tIvhojvk9C8DDcHe9M7fF9L_A')
+    
+    if BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+        print("❌ BOT_TOKEN not set! Please add it in Render environment variables.")
+        return
     
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler('start', start_command))
     application.add_handler(CommandHandler('check', check_command))
     
-    application.run_polling()
+    print("✅ Telegram bot started polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     # Start bot in a separate thread
